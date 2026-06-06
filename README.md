@@ -1,24 +1,31 @@
 # flutter_kokoro_tts
 
-A Flutter plugin for **Kokoro TTS** (text-to-speech) using ONNX Runtime and espeak-ng. Generates high-quality speech from text with multiple voices, runs fully on-device (no cloud API required).
+A Flutter plugin for **Kokoro TTS** (text-to-speech) using ONNX Runtime and espeak-ng. Generates high-quality speech from text with multiple voices, running fully on-device (no cloud API required).
 
 ## Features
 
-- **On-device inference** — ONNX model runs locally; no internet after initial model download
-- **Multiple voices** — Default, Bella, Nicole, Sarah, Adam, Michael
-- **Configurable speed** — Adjust speech rate per call (e.g. 0.5–2.0)
-- **24 kHz output** — Mono PCM at 24,000 Hz (Float32)
-- **Android & iOS** — Plugin supports both platforms (espeak-ng linked per platform)
+- **On-device inference** — ONNX model runs locally; no internet after initial model download.
+- **Dynamic model management** — Check download status and perform downloading/extracting directly through the API.
+- **Batch & Streaming synthesis** — Speak standard sentences or stream audio chunks sentence-by-sentence.
+- **Multiple voices** — Supports pre-packaged voices (e.g., `Bella`, `Echo`).
+- **Configurable speed** — Adjust speech rate per call.
+- **24 kHz output** — Mono PCM at 24,000 Hz (Float32).
+- **Android & iOS** — Supporting both platforms with native espeak-ng linking.
 
 ---
 
 ## Installation
 
-Add to your `pubspec.yaml`:
+Since this package is hosted on your GitHub, add it to your `pubspec.yaml` using the Git dependency format:
 
 ```yaml
 dependencies:
-  flutter_kokoro_tts: ^0.0.1
+  flutter_kokoro_tts:
+    git:
+      url: https://github.com/AbhiralJain/flutter_kokoro_tts.git
+      ref: main
+  path_provider: ^2.1.5  # Required to get the application documents directory
+  path: ^1.9.1
 ```
 
 Then run:
@@ -27,185 +34,138 @@ Then run:
 flutter pub get
 ```
 
-### Requirements
+### Platform Requirements
 
 - **Flutter** — SDK 3.10+
-- **Android** — minSdk 21+ (plugin uses NDK/CMake for native code). Install **CMake** and **NDK** via Android Studio → SDK Manager → SDK Tools if you see a CMake-not-found error.
+- **Android** — minSdk 21+ (plugin uses NDK/CMake for native code). Install **CMake** and **NDK** via Android Studio if needed.
 - **iOS** — iOS 11.0+
-
-On first use, the plugin downloads the Kokoro ONNX model and voice files from Hugging Face (~50 MB). Ensure the app has network and storage permissions as needed.
-
-**espeak-ng data** — Phonemization requires the espeak-ng data files. By default the plugin extracts them from the bundled asset; see [scripts/README_espeak_data.md](scripts/README_espeak_data.md) if you need a custom path or to build the data yourself.
 
 ---
 
-## Step-by-step usage
+## Step-by-step Usage
 
-### Step 1: Add the dependency and import
-
-```yaml
-# pubspec.yaml
-dependencies:
-  flutter_kokoro_tts: ^0.0.1
-```
+### Step 1: Import the Package
 
 ```dart
 import 'package:flutter_kokoro_tts/flutter_kokoro_tts.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 ```
 
-### Step 2: Create an instance
+### Step 2: Check & Download Model Assets
+
+Before using `KokoroTts`, ensure the required model and voice assets (~50 MB zip) are downloaded and extracted to the local device:
 
 ```dart
-final tts = KokoroTts();
+// Check if the assets are already downloaded
+final bool downloaded = await KokoroTts.isDownloaded();
+
+if (!downloaded) {
+  // Download and extract model assets (from R2 R2.dev mirror)
+  await KokoroTts.downloadAndExtractTts(
+    onProgress: (progress) {
+      // progress: 0.0 to 1.0
+      print('Download/Extraction Progress: ${(progress * 100).toStringAsFixed(1)}%');
+    },
+  );
+}
 ```
 
-### Step 3: Initialize (optional but recommended)
+### Step 3: Instantiate the Engine
 
-Initialize early (e.g. when your app or screen loads) so the first speech is faster. The plugin will download the model and voices if needed.
+Instantiate the `KokoroTts` engine by passing the directory path where assets were extracted (the default download location is `getApplicationDocumentsDirectory() / tts`):
 
 ```dart
+final Directory appDocDir = await getApplicationDocumentsDirectory();
+final String ttsDir = p.join(appDocDir.path, 'tts');
+
+final tts = KokoroTts(ttsDir: ttsDir);
+```
+
+You can also check if the configured path contains the files using:
+```dart
+bool exists = tts.doesModelExist();
+```
+
+### Step 4: Initialize the Engine
+
+Initialize the engine to load the ONNX session and espeak phonemizer:
+
+```dart
+// Monitor engine state changes
+tts.onStateChanged = (state) {
+  print('State changed to: $state'); // TtsState.idle, initializing, ready, generating, error
+};
+
 await tts.initialize(
   onProgress: (progress, status) {
-    // progress: 0.0 to 1.0
-    // status: e.g. 'Downloading model...', 'Generating...', 'Ready'
-    print('$status ${(progress * 100).round()}%');
+    print('Initialization: $status - ${(progress * 100).round()}%');
   },
-  espeakDataPath: null,  // or path to dir containing espeak-ng-data
 );
 ```
 
-If you skip this, `generate()` will initialize automatically on first use.
+### Step 5: Generate Speech
 
-### Step 4: Generate speech
-
+#### Batch Speech (Waits for full audio)
 ```dart
-final audio = await tts.generate(
-  'Hello, this is Kokoro speaking.',
-  voice: 'Bella',   // see "Changing voice" below
-  speed: 1.0,       // see "Adjusting speed" below
+final Float32List audio = await tts.speak(
+  'Hello! This is Kokoro running fully on device.',
+  voice: 'Bella', // E.g., 'Bella' or 'Echo'
+  speed: 1.0,     // Playback-speed multiplier
 );
-// audio is Float32List, mono, 24 kHz (tts.sampleRate)
+// Output is Float32List, mono, 24,000 Hz (KokoroTts.sampleRate)
 ```
 
-### Step 5: Play or save the audio
-
-The plugin returns raw PCM (Float32, -1.0 to 1.0). Convert to WAV (or another format) and play with your preferred player, e.g. `audioplayers`:
-
+#### Streaming Speech (Sentence-by-sentence chunks)
 ```dart
-// Example: write WAV and play with audioplayers
-final wavBytes = buildWavBytes(audio, tts.sampleRate);
-final file = File('${(await getTemporaryDirectory()).path}/speech.wav');
-await file.writeAsBytes(wavBytes);
-await audioPlayer.play(DeviceFileSource(file.path));
+final stream = tts.speakStreaming(
+  'This is a longer text. It will generate audio sentence by sentence. You can start playing the first chunk immediately.',
+  voice: 'Bella',
+  speed: 1.0,
+);
+
+await for (final Float32List chunk in stream) {
+  // Feed audio chunk to your player
+}
 ```
+You can abort streaming between chunks by calling `tts.cancelStreaming()`.
 
-See the [example/](example/) app for a full WAV-building and playback example.
-
-### Step 6: Dispose when done
+### Step 6: Dispose when Done
 
 ```dart
 await tts.dispose();
 ```
 
-Call this when you no longer need TTS (e.g. when leaving the screen or closing the app) to release the ONNX session and native resources.
-
 ---
 
-## All features and options
+## Configuration & Customization
 
-### Changing voice
+### Available Voices
 
-Use the `voice` parameter in `generate()`. Available voices:
+Default configured voices:
+- `Bella` (Female, style file: `af_bella.bin`)
+- `Echo` (Male, style file: `am_echo.bin`)
 
-| Voice   | Description |
-|--------|-------------|
-| `Default` | Default voice |
-| `Bella`   | Female |
-| `Nicole`  | Female |
-| `Sarah`   | Female |
-| `Adam`    | Male |
-| `Michael` | Male |
-
-Get the list programmatically:
-
+You can supply custom voices via the `KokoroTts` constructor:
 ```dart
-final voices = tts.availableVoices;  // ['Default', 'Bella', 'Nicole', 'Sarah', 'Adam', 'Michael']
-
-final audio = await tts.generate(
-  'Hello world',
-  voice: 'Nicole',
-  speed: 1.0,
+final tts = KokoroTts(
+  ttsDir: ttsDir,
+  voices: [
+    KokoroVoice(name: 'Bella', binFile: 'af_bella.bin'),
+    KokoroVoice(name: 'Echo', binFile: 'am_echo.bin'),
+  ],
 );
 ```
 
-### Adjusting speed
+### Engine Lifecycle States (`TtsState`)
 
-Use the `speed` parameter in `generate()`. Values are relative (1.0 = normal).
-
-- **Slower:** `0.5` – `0.9`
-- **Normal:** `1.0`
-- **Faster:** `1.1` – `2.0` (or higher)
-
-```dart
-final audio = await tts.generate(
-  'Speaking slowly.',
-  voice: 'Default',
-  speed: 0.7,
-);
-
-final fastAudio = await tts.generate(
-  'Speaking quickly.',
-  voice: 'Default',
-  speed: 1.5,
-);
-```
-
-### Initialize options
-
-| Parameter          | Type     | Description |
-|--------------------|----------|-------------|
-| `onProgress`       | `void Function(double progress, String status)?` | Called during download/init; use for a progress bar or status text. |
-| `espeakDataPath`   | `String?` | Directory containing `espeak-ng-data`, or `null` to use the default (extracted from package asset). |
-
-```dart
-await tts.initialize(
-  onProgress: (progress, status) => updateUI(progress, status),
-  espeakDataPath: '/custom/path/to/espeak-ng-data',  // optional
-);
-```
-
-### Generate options
-
-| Parameter | Type     | Default   | Description |
-|-----------|----------|-----------|-------------|
-| `text`    | `String` | —         | Text to speak. Empty or whitespace returns empty audio. |
-| `voice`   | `String` | `'Default'` | One of `availableVoices`. |
-| `speed`   | `double` | `1.0`     | Playback speed (e.g. 0.5–2.0). |
-
-### Other API
-
-| Member            | Description |
-|-------------------|-------------|
-| `availableVoices` | List of voice names. |
-| `sampleRate`      | Output sample rate (24000). |
-| `dispose()`       | Releases ONNX session and native resources. |
-
-Empty or whitespace-only text returns an empty `Float32List` without initializing. An invalid `voice` throws an `Exception`.
+- `TtsState.idle`: `initialize` has not been called yet.
+- `TtsState.initializing`: ONNX session and phonemizer are being loaded.
+- `TtsState.ready`: Ready to speak or stream.
+- `TtsState.generating`: Currently synthesizing audio.
+- `TtsState.error`: A fatal error occurred (check `tts.errorMessage`).
 
 ---
-
-## Example
-
-See the [example/](example/) app for a minimal UI: text input, voice picker, generate + play using `audioplayers` and a small WAV writer.
-
-```bash
-cd example && flutter run
-```
-
-## Platform notes
-
-- **Android** — Native espeak-ng and ONNX are built via CMake/NDK. Install CMake and NDK from SDK Manager if needed.
-- **iOS** — Plugin force-links espeak-ng for Dart FFI. Run on simulator or device to verify.
 
 ## License
 
