@@ -2,3 +2,4 @@
 library;
 
 export 'src/kokoro_tts.dart';
+export 'src/model_manager.dart';

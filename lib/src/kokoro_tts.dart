@@ -1,305 +1,446 @@
-import 'dart:io';
+// kokoro_tts.dart
+//
+// Pure-Dart Kokoro TTS engine. No Flutter, no ChangeNotifier, no Provider.
+// Safe to use in any Dart/Flutter project or as a standalone package.
+//
+// Expects assets already extracted to a directory you supply via [ttsDir]:
+//
+//   <ttsDir>/
+//     ├── kokoro.onnx          ← ONNX model (int8 or fp32)
+//     ├── <voice>.bin          ← style embeddings  (one per voice)
+//     └── espeak-ng-data/      ← phonemizer data
+//
+// Quick start:
+//   final tts = KokoroTts(ttsDir: '/path/to/tts');
+//   await tts.initialize();
+//   final pcm = await tts.speak('Hello world');   // Float32List, 24 kHz mono
+//   await tts.dispose();
 
-import 'package:flutter/foundation.dart';
+import 'dart:async';
+import 'dart:developer' as dev;
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
+import 'package:path/path.dart' as p;
+
 import 'model_manager.dart';
 import 'phonemizer.dart';
 import 'text_cleaner.dart';
 import 'text_preprocessor.dart';
 
-const List<String> kokoroVoices = [
-  'Default', // af.bin
-  'Bella', // af_bella.bin
-  'Nicole', // af_nicole.bin
-  'Sarah', // af_sarah.bin
-  'Adam', // am_adam.bin
-  'Michael', // am_michael.bin
+// ── Voice model ───────────────────────────────────────────────────────────────
+
+/// Describes a single TTS voice.
+///
+/// [name]      Display / lookup name (e.g. `'Bella'`).
+/// [binFile]   Filename of the style-embedding binary inside [KokoroTts.ttsDir]
+///             (e.g. `'af_bella.bin'`).
+/// [speedPrior] Multiplied with the caller's [speed] before inference.
+///              Values below 1.0 slow the voice down; the default of 0.8
+///              matches the upstream Kokoro reference.
+class KokoroVoice {
+  const KokoroVoice({required this.name, required this.binFile, this.speedPrior = 0.8});
+
+  final String name;
+  final String binFile;
+  final double speedPrior;
+}
+
+/// Built-in voices shipped with the reference asset zip.
+/// Pass a subset or extend this list via [KokoroTts.voices].
+const List<KokoroVoice> defaultVoices = [
+  KokoroVoice(name: 'Bella', binFile: 'af_bella.bin'),
+  KokoroVoice(name: 'Echo', binFile: 'am_echo.bin'),
 ];
 
-/// Map of voice names to their corresponding file names
-const Map<String, String> _kokoroVoiceMap = {
-  'Default': 'af.bin',
-  'Bella': 'af_bella.bin',
-  'Nicole': 'af_nicole.bin',
-  'Sarah': 'af_sarah.bin',
-  'Adam': 'am_adam.bin',
-  'Michael': 'am_michael.bin',
-};
+// ── Engine state ──────────────────────────────────────────────────────────────
 
-const Map<String, double> _speedPriors = {
-  'Default': 0.8,
-  'Bella': 0.8,
-  'Nicole': 0.8,
-  'Sarah': 0.8,
-  'Adam': 0.8,
-  'Michael': 0.8,
-};
+/// Lifecycle state of the [KokoroTts] engine.
+enum TtsState {
+  /// [KokoroTts.initialize] has not been called yet.
+  idle,
 
+  /// Engine is loading the ONNX session and phonemizer.
+  initializing,
+
+  /// Ready to accept [KokoroTts.speak] / [KokoroTts.speakStreaming] calls.
+  ready,
+
+  /// Currently synthesising audio.
+  generating,
+
+  /// A fatal error occurred; see [KokoroTts.errorMessage].
+  error,
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+
+/// Kokoro on-device TTS engine.
+///
+/// ```dart
+/// final tts = KokoroTts(ttsDir: '/data/user/0/com.example/files/tts');
+///
+/// tts.onStateChanged = (s) => print('state → $s');
+///
+/// await tts.initialize(onProgress: (p, msg) => print('$p $msg'));
+///
+/// // Batch (waits for full audio before returning)
+/// final pcm = await tts.speak('Hello!');
+///
+/// // Streaming (yields one sentence at a time)
+/// await for (final chunk in tts.speakStreaming('Long text…')) {
+///   player.feed(chunk);
+/// }
+///
+/// await tts.dispose();
+/// ```
 class KokoroTts {
-  final KokoroModelManager _modelManager = KokoroModelManager();
-  final Phonemizer _phonemizer = Phonemizer();
-  final TextCleaner _textCleaner = TextCleaner();
-  final TextPreprocessor _textPreprocessor = TextPreprocessor();
+  /// Creates a new engine instance.
+  ///
+  /// [ttsDir]   Absolute path to the directory containing the model,
+  ///            voice `.bin` files, and `espeak-ng-data/`.
+  /// [voices]   Voice list; defaults to [defaultVoices].
+  /// [modelFile] Model filename inside [ttsDir]; defaults to `'kokoro.onnx'`.
+  KokoroTts({required this.ttsDir, List<KokoroVoice>? voices, this.modelFile = 'kokoro.onnx'})
+    : voices = voices ?? List.unmodifiable(defaultVoices);
+
+  // ── Configuration ─────────────────────────────────────────────────────────
+
+  /// Absolute path to the directory that holds the model + assets.
+  final String ttsDir;
+
+  /// Model filename inside [ttsDir].
+  final String modelFile;
+
+  /// Available voices. Populated from the constructor argument.
+  final List<KokoroVoice> voices;
+
+  // ── Public state ──────────────────────────────────────────────────────────
+
+  TtsState _state = TtsState.idle;
+
+  /// Current engine state.
+  TtsState get state => _state;
+
+  /// Last error message, set when [state] is [TtsState.error].
+  String? errorMessage;
+
+  /// Called every time [state] changes.
+  /// Use this to drive reactive UI without depending on Provider / Riverpod.
+  ///
+  /// ```dart
+  /// tts.onStateChanged = (s) => setState(() => _ttsState = s);
+  /// ```
+  void Function(TtsState state)? onStateChanged;
+
+  /// Output sample rate – always 24 000 Hz for Kokoro.
+  static const int sampleRate = 24000;
+
+  // ── Private fields ────────────────────────────────────────────────────────
+
   static const int _maxTokens = 500;
+  static const int _styleDim = 256;
 
   OrtSession? _session;
-  bool _isInitialized = false;
-  Future<void>? _initializing;
 
-  /// Output sample rate (always 24 000 Hz)
-  int sampleRate = 24000;
+  final _phonemizer = Phonemizer();
+  final _textCleaner = TextCleaner();
+  final _textPreprocessor = TextPreprocessor();
 
-  /// Name of available voices.
-  List<String> get availableVoices => List.unmodifiable(kokoroVoices);
-
-  /// Voice cache
   final Map<String, Float32List> _voiceCache = {};
 
-  /// Initialize the Kokoro TTS engine.
-  ///
-  /// [espeakDataPath] Optional. Directory that contains espeak-ng-data (with
-  /// phontab, etc.), or the espeak-ng-data directory itself. If null, uses
-  /// the kokoro base dir (parent of the model dir); you must place
-  /// espeak-ng-data there or pass a valid path. See README for obtaining data.
-  Future<void> initialize({
-    void Function(double progress, String status)? onProgress,
-    String? espeakDataPath,
-  }) {
-    // If already initialized → return completed future
-    if (_isInitialized) return Future.value();
+  Future<void>? _initFuture;
+  bool _cancelStreaming = false;
 
-    // If initialization is in progress → return same future
-    if (_initializing != null) return _initializing!;
+  // ── Voice lookup helpers ──────────────────────────────────────────────────
 
-    _initializing = _doInitialize(onProgress, espeakDataPath);
-
-    return _initializing!;
+  KokoroVoice? _findVoice(String name) {
+    try {
+      return voices.firstWhere((v) => v.name == name);
+    } catch (_) {
+      return null;
+    }
   }
 
-  Future<void> _doInitialize(
-    void Function(double progress, String status)? onProgress,
-    String? espeakDataPath,
-  ) async {
+  // ── Initialisation ────────────────────────────────────────────────────────
+
+  /// Initialises the engine (idempotent – safe to call multiple times).
+  ///
+  /// [onProgress] receives values in `[0.0, 1.0]` with a human-readable
+  /// status string.  Pass `null` if you don't need progress updates.
+  ///
+  /// Throws on failure; call [initialize] again to retry.
+  Future<void> initialize({void Function(double progress, String status)? onProgress}) {
+    if (_state == TtsState.ready) return Future.value();
+    _initFuture ??= _doInitialize(onProgress);
+    return _initFuture!;
+  }
+
+  Future<void> _doInitialize(void Function(double progress, String status)? onProgress) async {
+    _setState(TtsState.initializing);
     try {
-      onProgress?.call(0.0, 'Downloading model...');
+      onProgress?.call(0.1, 'Locating assets…');
+      _assertAssets();
 
-      await _modelManager.download(
-        onProgress: (p, status) {
-          onProgress?.call(p, status);
-        },
-      );
+      onProgress?.call(0.4, 'Loading phonemizer…');
+      _phonemizer.initialize(dataPath: ttsDir);
 
-      if (espeakDataPath == null) {
-        onProgress?.call(0.9, 'Ensuring espeak-ng data...');
-        await _modelManager.ensureEspeakData();
-      }
-      final dataPath = espeakDataPath ?? _modelManager.kokoroBaseDir;
-      _phonemizer.initialize(dataPath: dataPath);
-
-      onProgress?.call(0.97, 'Loading ONNX session...');
+      onProgress?.call(0.7, 'Loading ONNX model…');
       final ort = OnnxRuntime();
-      _session = await ort.createSession(_modelManager.modelPath);
+      _session = await ort.createSession(p.join(ttsDir, modelFile));
 
-      _isInitialized = true;
+      _setState(TtsState.ready);
       onProgress?.call(1.0, 'Ready');
-    } catch (e) {
-      _initializing = null; // allow retry if failed
+    } catch (e, st) {
+      _initFuture = null; // allow retry
+      errorMessage = e.toString();
+      _setState(TtsState.error);
+      dev.log('[KokoroTts] init error: $e\n$st', name: 'KokoroTts');
       rethrow;
     }
   }
 
-  Future<Float32List> _getVoice(String voice) async {
-    if (_voiceCache.containsKey(voice)) {
-      return _voiceCache[voice]!;
+  /// Throws a clear [Exception] for each missing required file.
+  void _assertAssets() {
+    // Model
+    _requireFile(p.join(ttsDir, modelFile), 'ONNX model');
+
+    // espeak-ng-data sentinel
+    _requireFile(p.join(ttsDir, 'espeak-ng-data', 'phontab'), 'espeak-ng-data/phontab');
+
+    // Voice .bin files
+    for (final v in voices) {
+      _requireFile(p.join(ttsDir, v.binFile), 'voice "${v.name}"');
     }
-
-    final path = '${_modelManager.modelDir}/voices/${_kokoroVoiceMap[voice]!}';
-
-    final bytes = await File(path).readAsBytes();
-    final embedding = bytes.buffer.asFloat32List();
-
-    _voiceCache[voice] = embedding;
-    return embedding;
   }
 
-  Future<Float32List> generate(
-    String text, {
-    String voice = 'Default',
-    double speed = 1.0,
-  }) async {
-    if (text.trim().isEmpty) return Float32List(0);
-
-    await initialize();
-
-    if (!availableVoices.contains(voice)) {
-      throw Exception('Invalid voice: $voice');
+  void _requireFile(String path, String label) {
+    if (!File(path).existsSync()) {
+      throw Exception(
+        '[KokoroTts] Missing $label at $path.\n'
+        'Ensure the asset zip was extracted to "$ttsDir" before calling initialize().',
+      );
     }
+  }
 
-    final chunks = _splitIntoChunks(text);
+  // ── Public API ────────────────────────────────────────────────────────────
+
+  /// Returns true if the TTS files are already downloaded and present in the default location.
+  static Future<bool> isDownloaded() async {
+    return KokoroModelManager().isReady();
+  }
+
+  /// Downloads and extracts the TTS model and assets to the default location.
+  static Future<void> downloadAndExtractTts({void Function(double progress)? onProgress}) async {
+    await KokoroModelManager().downloadAndExtractTts(onProgress: onProgress);
+  }
+
+  /// Returns true if the assets required by this instance exist in [ttsDir].
+  bool doesModelExist() {
+    try {
+      _assertAssets();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Synthesises [text] and returns the complete audio as a [Float32List].
+  ///
+  /// Waits for all sentences to be generated before returning.
+  /// Use [speakStreaming] if you want audio to start playing sooner.
+  ///
+  /// - [voice]  voice name from [voices] (defaults to `voices.first.name`).
+  /// - [speed]  playback-speed multiplier; combined with the voice's
+  ///            [KokoroVoice.speedPrior].
+  ///
+  /// Returns an empty [Float32List] for blank input.
+  /// Throws [StateError] if not [TtsState.ready].
+  Future<Float32List> speak(String text, {String? voice, double speed = 1.0}) async {
+    final v = _resolveVoice(voice);
+    if (text.trim().isEmpty) return Float32List(0);
+    _requireReady();
+
+    _setState(TtsState.generating);
+    try {
+      final audio = await _generate(text, voice: v, speed: speed);
+      _setState(TtsState.ready);
+      return audio;
+    } catch (e) {
+      errorMessage = e.toString();
+      _setState(TtsState.error);
+      rethrow;
+    }
+  }
+
+  /// Synthesises [text] sentence-by-sentence and yields each [Float32List]
+  /// chunk as soon as it is ready.
+  ///
+  /// The caller can begin playback on the first event while the engine is
+  /// still generating subsequent sentences.
+  ///
+  /// Call [cancelStreaming] to abort between chunks.
+  ///
+  /// Throws [StateError] if not [TtsState.ready].
+  Stream<Float32List> speakStreaming(String text, {String? voice, double speed = 1.0}) async* {
+    final v = _resolveVoice(voice);
+    if (text.trim().isEmpty) return;
+    _requireReady();
+
+    _cancelStreaming = false;
+    _setState(TtsState.generating);
+
+    try {
+      for (final chunk in _splitIntoChunks(text)) {
+        if (_cancelStreaming) {
+          dev.log('[KokoroTts] streaming cancelled', name: 'KokoroTts');
+          break;
+        }
+        final audio = await _generateChunk(chunk, voice: v, speed: speed);
+        if (audio.isNotEmpty) yield audio;
+      }
+    } catch (e) {
+      errorMessage = e.toString();
+      _setState(TtsState.error);
+      rethrow;
+    } finally {
+      if (_state == TtsState.generating) _setState(TtsState.ready);
+    }
+  }
+
+  /// Stops [speakStreaming] after the current in-flight chunk completes.
+  /// No-op if not currently streaming.
+  void cancelStreaming() {
+    _cancelStreaming = true;
+    dev.log('[KokoroTts] cancelStreaming()', name: 'KokoroTts');
+  }
+
+  // ── Core synthesis ────────────────────────────────────────────────────────
+
+  Future<Float32List> _generate(String text, {required KokoroVoice voice, required double speed}) async {
     final parts = <Float32List>[];
-
-    for (final chunk in chunks) {
+    for (final chunk in _splitIntoChunks(text)) {
       final audio = await _generateChunk(chunk, voice: voice, speed: speed);
       if (audio.isNotEmpty) parts.add(audio);
     }
-
-    if (parts.isEmpty) return Float32List(0);
-    if (parts.length == 1) return parts.first;
-
-    final total = parts.fold<int>(0, (sum, part) => sum + part.length);
-    final result = Float32List(total);
-    var offset = 0;
-    for (final part in parts) {
-      result.setRange(offset, offset + part.length, part);
-      offset += part.length;
-    }
-    return result;
+    return _concat(parts);
   }
 
-  Future<Float32List> _generateChunk(
-    String chunk, {
-    required String voice,
-    required double speed,
-  }) async {
-    // --Text Cleaning & Preprocessing--
-    final cleanText = _textPreprocessor.process(chunk);
-    final cleanTextWithPunctuation = _addTrailingPunctuation(cleanText.trim());
-    debugPrint('[kokoroTTS]: clean text: $cleanTextWithPunctuation');
+  Future<Float32List> _generateChunk(String chunk, {required KokoroVoice voice, required double speed}) async {
+    // ── Text pipeline ───────────────────────────────────────────────────────
+    final cleaned = _addTrailingPunctuation(_textPreprocessor.process(chunk).trim());
+    dev.log('[KokoroTts] cleaned: $cleaned', name: 'KokoroTts');
 
-    // --Phonemization--
-    final phonemes = _phonemizer.phonemize(cleanTextWithPunctuation);
-    debugPrint('[kokoroTTS]: phonemes: $phonemes');
+    final phonemes = _phonemizer.phonemize(cleaned);
+    dev.log('[KokoroTts] phonemes: $phonemes', name: 'KokoroTts');
 
-    // --Encoding--
-    final encodedTokens = _textCleaner.encodeAndWrap(phonemes);
-    debugPrint('[kokoroTTS]: encoded: $encodedTokens');
+    final tokens = _textCleaner.encodeAndWrap(phonemes);
+    dev.log('[KokoroTts] tokens (${tokens.length})', name: 'KokoroTts');
 
-    // -- Guard: split if tokens exceed model capacity --
-    if (encodedTokens.length > _maxTokens) {
-      debugPrint(
-        '[kokoroTTS]: splitting chunk into multiple parts due to token limit',
-      );
-      final mid = encodedTokens.length ~/ 2;
-      int splitAt = chunk.indexOf(RegExp(r'[.!?,;:\s]'), mid);
-      if (splitAt < 0 || splitAt == chunk.length - 1) splitAt = mid;
-      final firstHalf = chunk.substring(0, splitAt);
-      final secondHalf = chunk.substring(splitAt);
-      debugPrint('[kokoroTTS]: first half: $firstHalf');
-      debugPrint('[kokoroTTS]: second half: $secondHalf');
+    // ── Token-limit guard ───────────────────────────────────────────────────
+    if (tokens.length > _maxTokens) {
+      dev.log('[KokoroTts] bisecting chunk', name: 'KokoroTts');
+      final mid = chunk.length ~/ 2;
+      int splitAt = chunk.lastIndexOf(RegExp(r'[.!?,;:\s]'), mid);
+      if (splitAt <= 0) splitAt = mid;
 
       final parts = <Float32List>[];
-      if (firstHalf.isNotEmpty) {
-        parts.add(await _generateChunk(firstHalf, voice: voice, speed: speed));
+      final first = chunk.substring(0, splitAt).trim();
+      final second = chunk.substring(splitAt).trim();
+      if (first.isNotEmpty) {
+        parts.add(await _generateChunk(first, voice: voice, speed: speed));
       }
-      if (secondHalf.isNotEmpty) {
-        parts.add(await _generateChunk(secondHalf, voice: voice, speed: speed));
+      if (second.isNotEmpty) {
+        parts.add(await _generateChunk(second, voice: voice, speed: speed));
       }
-
-      if (parts.isEmpty) return Float32List(0);
-      if (parts.length == 1) return parts.first;
-
-      final total = parts.fold<int>(0, (sum, part) => sum + part.length);
-      final result = Float32List(total);
-      var offset = 0;
-      for (final part in parts) {
-        result.setRange(offset, offset + part.length, part);
-        offset += part.length;
-      }
-      return result;
+      return _concat(parts);
     }
 
-    // -- Voice: .bin files are (N, 256); model expects style [1, 256]. Pick row by token length.
-    const styleDim = 256;
-    final styleAll = await _getVoice(voice);
-    final numVectors = styleAll.length ~/ styleDim;
+    // ── Style vector ────────────────────────────────────────────────────────
+    final styleAll = await _loadVoice(voice);
+    final numVectors = styleAll.length ~/ _styleDim;
     if (numVectors == 0) {
       throw Exception(
-        'Voice file for "$voice" has no style vectors (expected multiple of $styleDim floats)',
+        '[KokoroTts] Voice "${voice.name}" has no style vectors '
+        '(expected multiples of $_styleDim floats in ${voice.binFile}).',
       );
     }
-    final tokenLen = encodedTokens.length.clamp(0, numVectors - 1);
-    final style = Float32List.sublistView(
-      styleAll,
-      tokenLen * styleDim,
-      (tokenLen + 1) * styleDim,
-    );
-    debugPrint(
-      '[kokoroTTS]: style embedding: ${style.length} (row $tokenLen of $numVectors)',
-    );
+    final row = tokens.length.clamp(0, numVectors - 1);
+    final style = Float32List.sublistView(styleAll, row * _styleDim, (row + 1) * _styleDim);
 
-    // -- Speed Adjustment --
-    final speedFactor = _speedPriors[voice]!;
-    debugPrint('[kokoroTTS]: speed factor: $speedFactor');
+    // ── ONNX inference ──────────────────────────────────────────────────────
+    final effectiveSpeed = speed * voice.speedPrior;
 
-    final effectiveSpeed = speed * speedFactor;
-
-    // - ONNX inference --
-    final inputIds = await OrtValue.fromList(
-      Int64List.fromList(encodedTokens),
-      [1, encodedTokens.length],
-    );
-
-    final styleTensor = await OrtValue.fromList(style, [1, styleDim]);
-
+    final inputIds = await OrtValue.fromList(Int64List.fromList(tokens), [1, tokens.length]);
+    final styleTensor = await OrtValue.fromList(style, [1, _styleDim]);
     final speedTensor = await OrtValue.fromList([effectiveSpeed], [1]);
 
-    final outputs = await _session!.run({
-      'input_ids': inputIds,
-      'style': styleTensor,
-      'speed': speedTensor,
-    });
+    final outputs = await _session!.run({'input_ids': inputIds, 'style': styleTensor, 'speed': speedTensor});
 
-    // Dispose inputs
     await inputIds.dispose();
     await styleTensor.dispose();
     await speedTensor.dispose();
 
-    // Find the audio output tensor (largest)
-
-    OrtValue? audioOut;
-    int audioLen = 0;
-    for (final entry in outputs.entries) {
-      final len = entry.value.shape.fold<int>(1, (a, b) => a * b);
-      if (len > audioLen) {
-        audioOut = entry.value;
-        audioLen = len;
+    // ── Extract audio tensor (largest output) ───────────────────────────────
+    OrtValue? audioTensor;
+    int maxLen = 0;
+    for (final v in outputs.values) {
+      final len = v.shape.fold<int>(1, (a, b) => a * b);
+      if (len > maxLen) {
+        maxLen = len;
+        audioTensor = v;
       }
     }
 
-    if (audioOut == null) {
+    if (audioTensor == null) {
+      for (final v in outputs.values) {
+        await v.dispose();
+      }
       return Float32List(0);
     }
 
-    final rawList = await audioOut.asFlattenedList();
-
-    // Dispose all output tensors
+    final rawList = await audioTensor.asFlattenedList();
     for (final v in outputs.values) {
       await v.dispose();
     }
 
+    // ── Normalise to Float32List ─────────────────────────────────────────────
     Float32List audio;
-
-    if (rawList is List<double>) {
-      audio = Float32List.fromList(rawList.cast<double>());
+    if (rawList is Float32List) {
+      audio = rawList;
+    } else if (rawList is List<double>) {
+      audio = Float32List.fromList(rawList);
     } else {
-      audio = Float32List.fromList(
-        rawList.map((e) => (e as num).toDouble()).toList(),
-      );
+      audio = Float32List.fromList((rawList).map((e) => (e as num).toDouble()).toList());
     }
 
-    // Trim trailing silence
+    // Trim trailing silence padded by the model
     if (audio.length > 5000) {
       audio = Float32List.sublistView(audio, 0, audio.length - 5000);
     }
 
-    debugPrint(
-      '[kokoroTTS]: audio length: ${audio.length}, samples: ${audio.length ~/ 2}',
-    );
-
+    dev.log('[KokoroTts] generated ${audio.length} samples', name: 'KokoroTts');
     return audio;
   }
 
-  // ── Helpers ──
+  // ── Voice loading ─────────────────────────────────────────────────────────
+
+  Future<Float32List> _loadVoice(KokoroVoice voice) async {
+    if (_voiceCache.containsKey(voice.name)) return _voiceCache[voice.name]!;
+    final path = p.join(ttsDir, voice.binFile);
+    final bytes = await File(path).readAsBytes();
+    final embedding = bytes.buffer.asFloat32List();
+    _voiceCache[voice.name] = embedding;
+    dev.log(
+      '[KokoroTts] loaded "${voice.name}" – '
+      '${embedding.length ~/ _styleDim} style vectors',
+      name: 'KokoroTts',
+    );
+    return embedding;
+  }
+
+  // ── Text helpers ──────────────────────────────────────────────────────────
 
   List<String> _splitIntoChunks(String text, {int maxLen = 200}) {
     final sentences = text.split(RegExp(r'(?<=[.!?])\s+'));
@@ -328,25 +469,60 @@ class KokoroTts {
     return '.!?,;:'.contains(t[t.length - 1]) ? t : '$t,';
   }
 
-  // static String _trunc(String s, [int n = 60]) =>
-  //     s.length <= n ? s : '${s.substring(0, n)}…';
-
-  Future<void> dispose() async {
-    if (!_isInitialized) return;
-
-    // Dispose ONNX session
-    if (_session != null) {
-      await _session!.close();
-      _session = null;
+  static Float32List _concat(List<Float32List> parts) {
+    if (parts.isEmpty) return Float32List(0);
+    if (parts.length == 1) return parts.first;
+    final total = parts.fold<int>(0, (sum, p) => sum + p.length);
+    final result = Float32List(total);
+    var offset = 0;
+    for (final part in parts) {
+      result.setRange(offset, offset + part.length, part);
+      offset += part.length;
     }
+    return result;
+  }
 
-    // Dispose phonemizer
+  // ── Guards ────────────────────────────────────────────────────────────────
+
+  KokoroVoice _resolveVoice(String? name) {
+    final target = name ?? voices.first.name;
+    final v = _findVoice(target);
+    if (v == null) {
+      throw ArgumentError(
+        '[KokoroTts] Unknown voice "$target". '
+        'Available: ${voices.map((v) => v.name).join(', ')}',
+      );
+    }
+    return v;
+  }
+
+  void _requireReady() {
+    if (_state != TtsState.ready) {
+      throw StateError(
+        '[KokoroTts] Engine is not ready (state: $_state). '
+        'Call initialize() and await it first.',
+      );
+    }
+  }
+
+  // ── State management ──────────────────────────────────────────────────────
+
+  void _setState(TtsState s) {
+    _state = s;
+    onStateChanged?.call(s);
+  }
+
+  // ── Disposal ──────────────────────────────────────────────────────────────
+
+  /// Releases the ONNX session, phonemizer, and voice cache.
+  /// The instance must not be used after this call.
+  Future<void> dispose() async {
+    await _session?.close();
+    _session = null;
     _phonemizer.dispose();
-
-    // clear voice cache
     _voiceCache.clear();
-
-    _isInitialized = false;
-    _initializing = null;
+    _state = TtsState.idle;
+    _initFuture = null;
+    onStateChanged = null;
   }
 }
