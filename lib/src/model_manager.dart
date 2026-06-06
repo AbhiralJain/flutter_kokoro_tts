@@ -109,58 +109,12 @@ class KokoroModelManager {
     required Directory ttsDir,
     void Function(double)? onProgress,
   }) async {
-    final InputFileStream inputStream;
     try {
-      inputStream = InputFileStream(tempZipFile.path);
+      onProgress?.call(0.92);
+      await extractFileToDisk(tempZipFile.path, ttsDir.path);
+      onProgress?.call(1.0);
     } catch (e) {
-      throw TtsExtractionException('Could not open zip for reading.', cause: e);
-    }
-
-    try {
-      final Archive archive;
-      try {
-        archive = ZipDecoder().decodeStream(inputStream);
-      } catch (e) {
-        throw TtsExtractionException('Zip decoding failed.', cause: e);
-      }
-
-      final List<ArchiveFile> files = archive.files.where((f) => f.isFile).toList(growable: false);
-      int extracted = 0;
-
-      for (final ArchiveFile file in archive) {
-        final String normalizedPath = p.normalize(file.name);
-        final String filePath = p.join(ttsDir.path, normalizedPath);
-
-        // Path traversal guard.
-        if (!p.isWithin(ttsDir.path, filePath)) continue;
-
-        if (file.isFile) {
-          try {
-            // Ensure parent directory exists.
-            final Directory parentDir = Directory(p.dirname(filePath));
-            if (!parentDir.existsSync()) {
-              parentDir.createSync(recursive: true);
-            }
-
-            // OutputFileStream writes directly to disk — avoids loading
-            // the entire decompressed file into RAM at once.
-            final OutputFileStream outStream = OutputFileStream(filePath);
-            file.writeContent(outStream);
-            await outStream.close();
-            file.clear(); // Release decompressed bytes from memory cache
-          } catch (e) {
-            throw TtsExtractionException('Failed to write ${file.name}.', cause: e);
-          }
-
-          extracted++;
-          // Extraction accounts for remaining ~10%.
-          onProgress?.call(0.9 + (extracted / files.length) * 0.1);
-        } else {
-          Directory(filePath).createSync(recursive: true);
-        }
-      }
-    } finally {
-      inputStream.close();
+      throw TtsExtractionException('Failed to extract ZIP file.', cause: e);
     }
   }
 }
