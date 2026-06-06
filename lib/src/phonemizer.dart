@@ -48,7 +48,43 @@ class Phonemizer {
   String phonemize(String text) {
     if (!isInitialized) throw Exception('Espeak-ng not initialized');
 
-    return _espeak.phonemize(text);
+    // 1. Normalize hyphens/dashes that are acting as punctuation to em-dash (—)
+    text = text.replaceAll(RegExp(r'\s+-\s+'), ' — ');
+    text = text.replaceAll(RegExp(r'(?<=\w)-\s+'), ' — ');
+    text = text.replaceAll(RegExp(r'\s+-(?=\w)'), ' — ');
+
+    // 2. Split the text by punctuation marks that we want to preserve (including surrounding whitespace)
+    final regex = RegExp(r'(\s*[;:,.!?¡¿—…"«»“”]+\s*)');
+    final matches = regex.allMatches(text).toList();
+
+    if (matches.isEmpty) {
+      return _espeak.phonemize(text);
+    }
+
+    final buffer = StringBuffer();
+    var lastIndex = 0;
+
+    for (final match in matches) {
+      final textSegment = text.substring(lastIndex, match.start);
+      final punctuation = match.group(0)!;
+
+      if (textSegment.isNotEmpty) {
+        final phonemes = _espeak.phonemize(textSegment);
+        buffer.write(phonemes);
+      }
+      buffer.write(punctuation);
+      lastIndex = match.end;
+    }
+
+    if (lastIndex < text.length) {
+      final remainingText = text.substring(lastIndex);
+      if (remainingText.isNotEmpty) {
+        final phonemes = _espeak.phonemize(remainingText);
+        buffer.write(phonemes);
+      }
+    }
+
+    return buffer.toString();
   }
 
   // Dispose of espeak-ng

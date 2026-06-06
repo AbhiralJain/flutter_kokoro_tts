@@ -151,7 +151,6 @@ class KokoroTts {
   final Map<String, Float32List> _voiceCache = {};
 
   Future<void>? _initFuture;
-  bool _cancelStreaming = false;
 
   // ── Voice lookup helpers ──────────────────────────────────────────────────
 
@@ -188,7 +187,43 @@ class KokoroTts {
 
       onProgress?.call(0.7, 'Loading ONNX model…');
       final ort = OnnxRuntime();
-      _session = await ort.createSession(p.join(ttsDir, modelFile));
+      final primaryProviders = <OrtProvider>[];
+      if (Platform.isAndroid) {
+        primaryProviders.add(OrtProvider.NNAPI);
+      } else if (Platform.isIOS || Platform.isMacOS) {
+        primaryProviders.add(OrtProvider.CORE_ML);
+      }
+      primaryProviders.addAll([OrtProvider.XNNPACK, OrtProvider.CPU]);
+
+      final options = OrtSessionOptions(
+        intraOpNumThreads: 4,
+        interOpNumThreads: 1,
+        providers: primaryProviders,
+      );
+
+      final modelPath = p.join(ttsDir, modelFile);
+      try {
+        _session = await ort.createSession(modelPath, options: options);
+      } catch (e, st) {
+        final hasHardwareAccelerator = Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
+        if (hasHardwareAccelerator) {
+          dev.log(
+            '[KokoroTts] Primary session creation failed with hardware acceleration. '
+            'Retrying with fallback (CPU + XNNPACK). Error: $e',
+            name: 'KokoroTts',
+            error: e,
+            stackTrace: st,
+          );
+          final fallbackOptions = OrtSessionOptions(
+            intraOpNumThreads: 4,
+            interOpNumThreads: 1,
+            providers: [OrtProvider.XNNPACK, OrtProvider.CPU],
+          );
+          _session = await ort.createSession(modelPath, options: fallbackOptions);
+        } else {
+          rethrow;
+        }
+      }
 
       _setState(TtsState.ready);
       onProgress?.call(1.0, 'Ready');
@@ -274,47 +309,7 @@ class KokoroTts {
     }
   }
 
-  /// Synthesises [text] sentence-by-sentence and yields each [Float32List]
-  /// chunk as soon as it is ready.
-  ///
-  /// The caller can begin playback on the first event while the engine is
-  /// still generating subsequent sentences.
-  ///
-  /// Call [cancelStreaming] to abort between chunks.
-  ///
-  /// Throws [StateError] if not [TtsState.ready].
-  Stream<Float32List> speakStreaming(String text, {String? voice, double speed = 1.0}) async* {
-    final v = _resolveVoice(voice);
-    if (text.trim().isEmpty) return;
-    _requireReady();
 
-    _cancelStreaming = false;
-    _setState(TtsState.generating);
-
-    try {
-      for (final chunk in _splitIntoChunks(text)) {
-        if (_cancelStreaming) {
-          dev.log('[KokoroTts] streaming cancelled', name: 'KokoroTts');
-          break;
-        }
-        final audio = await _generateChunk(chunk, voice: v, speed: speed);
-        if (audio.isNotEmpty) yield audio;
-      }
-    } catch (e) {
-      errorMessage = e.toString();
-      _setState(TtsState.error);
-      rethrow;
-    } finally {
-      if (_state == TtsState.generating) _setState(TtsState.ready);
-    }
-  }
-
-  /// Stops [speakStreaming] after the current in-flight chunk completes.
-  /// No-op if not currently streaming.
-  void cancelStreaming() {
-    _cancelStreaming = true;
-    dev.log('[KokoroTts] cancelStreaming()', name: 'KokoroTts');
-  }
 
   // ── Core synthesis ────────────────────────────────────────────────────────
 
@@ -462,6 +457,8 @@ class KokoroTts {
     }
     return chunks.isEmpty ? [_addTrailingPunctuation(text.trim())] : chunks;
   }
+
+
 
   static String _addTrailingPunctuation(String t) {
     t = t.trim();
