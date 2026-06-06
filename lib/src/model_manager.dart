@@ -136,11 +136,18 @@ class KokoroModelManager {
 
         if (file.isFile) {
           try {
+            // Ensure parent directory exists.
+            final Directory parentDir = Directory(p.dirname(filePath));
+            if (!parentDir.existsSync()) {
+              parentDir.createSync(recursive: true);
+            }
+
             // OutputFileStream writes directly to disk — avoids loading
             // the entire decompressed file into RAM at once.
             final OutputFileStream outStream = OutputFileStream(filePath);
             file.writeContent(outStream);
             await outStream.close();
+            file.clear(); // Release decompressed bytes from memory cache
           } catch (e) {
             throw TtsExtractionException('Failed to write ${file.name}.', cause: e);
           }

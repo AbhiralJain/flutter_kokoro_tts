@@ -56,14 +56,14 @@ extern "C"
 
 #define PLATFORM_WINDOWS 1
 #define PATHSEP '\\'
-#define N_PATH_HOME_DEF  230
+#define N_PATH_HOME_DEF  1024
 #define NO_VARIADIC_MACROS
 
 #else
 
 #define PLATFORM_POSIX 1
 #define PATHSEP  '/'
-#define N_PATH_HOME_DEF  160
+#define N_PATH_HOME_DEF  1024
 #define USE_NANOSLEEP
 #define __cdecl
 
@@ -75,7 +75,7 @@ extern "C"
 
 // will look for espeak_data directory here, and also in user's home directory
 #ifndef PATH_ESPEAK_DATA
-   #define PATH_ESPEAK_DATA ("%cespeak-ng-data", PATHSEP)
+   #define PATH_ESPEAK_DATA ""
 #endif
 
 void cancel_audio(void);
